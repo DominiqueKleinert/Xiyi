@@ -1,7 +1,7 @@
 use crate::ast::{Type, PrivacyTag, ShapeDim, Literal, Pattern, BinaryOp, UnsafeKind, UnaryOp, IfKind};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, PartialEq, Clone, Default)]
 pub struct EffectSet {
     pub has_io: bool,
     pub has_rng: bool,
@@ -10,7 +10,35 @@ pub struct EffectSet {
     pub has_panic: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl EffectSet {
+    // 关键修复：merge 和 merge_with 原来是两份各自把五个字段抄一遍的
+    // OR 逻辑——内容完全重复，只是一个在循环里累加多个 EffectSet，
+    // 一个只处理一个。这种重复本身就是个隐患：以后 EffectSet 再加一个
+    // has_xxx 字段（这门语言目前已经有 io/rng/ai/ffi/panic 五种效应，
+    // 不难想见还会再加），改的人很容易只改其中一个函数就以为完事了，
+    // 另一个悄悄漏改，从此 merge 和 merge_with 在语义上不再等价，却没
+    // 有任何编译错误能提醒——这类"两处手抄同一份逻辑"的漏改，在这个
+    // 项目里已经反复出现过好几次了。把 merge 改成基于 merge_with 实现，
+    // 让"哪些字段要参与合并"只有一处需要维护，加字段时唯一要改的地方
+    // 就是 merge_with。
+    pub fn merge(sets: &[&EffectSet]) -> Self {
+        let mut merged = EffectSet::default();
+        for set in sets {
+            merged.merge_with(set);
+        }
+        merged
+    }
+
+    pub fn merge_with(&mut self, other: &EffectSet) {
+        self.has_io |= other.has_io;
+        self.has_rng |= other.has_rng;
+        self.has_ai |= other.has_ai;
+        self.has_ffi |= other.has_ffi;
+        self.has_panic |= other.has_panic;
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Sensitivity {
     Const(f64),
     Symbolic(String),
@@ -34,7 +62,7 @@ impl Default for Span {
 }
 
 // ===== HIR 里统一表示泛型参数，对应 ast::GenericParam::Type { name, bounds } =====
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct HirGenericParam {
     pub name: String,
     pub bounds: Vec<String>,

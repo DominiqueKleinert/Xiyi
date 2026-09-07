@@ -222,6 +222,36 @@ pub enum Pattern {
         binding: String,
     },
     Wildcard,
+    // ===== 新增：标量字面量模式 =====
+    // int/bool/char 三种字面量在语义上都只是"跟一个具体常量比较"，直接
+    // 存各自的 Rust 原生类型即可，不用再包一层 Literal——模式匹配用不
+    // 到 Literal 里 Float/String/Unit/ByteString 等其它变体，没必要为
+    // 了复用 Literal 而放宽这里能接受的种类。
+    IntLiteral(i64),
+    BoolLiteral(bool),
+    CharLiteral(char),
+    // ===== 新增：结构体/元组/数组解构 =====
+    // 这三种类型都不是和类型（sum type），不参与"判别式取哪个值"这种
+    // 比较——一个 match 表达式对着它们中的一种类型来匹配，只可能是
+    // "无条件解构绑定"，不是多路分支（mir_builder.rs 里这三种模式完
+    // 全不走 Switch，且要求所在的 match 有且只有一条 arm）。
+    //
+    // 每个字段/位置只支持"绑定到一个新局部变量"这一层，不支持在字段/
+    // 位置上继续嵌套子模式（比如 `Point { x: 0, y }` 或
+    // `(a, Point { .. })`）——这跟 EnumVariantWithBinding.binding 是同
+    // 一个"只绑一层、不递归"的扁平化设计，简单场景够用；真要支持嵌套
+    // 模式是明显更大的一块工作，留给以后单独做。
+    Struct {
+        struct_name: String,
+        // (字段名, 绑定成的新局部变量名)。不用列出结构体的全部字段——
+        // 跟 Rust 的 `Point { x, .. }` 部分模式类似，只解构关心的那几个。
+        fields: Vec<(String, String)>,
+    },
+    // 按位置绑定；某个位置写 None 表示对应源码里的 `_`（这个位置存在
+    // 但不关心，不绑定成变量）。
+    Tuple(Vec<Option<String>>),
+    // 按下标绑定的定长数组解构；None 的含义跟 Tuple 一致。
+    Array(Vec<Option<String>>),
 }
 
 // ===== 语句枚举 =====
@@ -361,7 +391,11 @@ pub enum ExprKind {
 }
 
 // ===== 一元运算符 =====
-#[derive(Debug, PartialEq, Clone)]
+// 关键修复：补上 Copy——simplify.rs 里 Calc::eval_unary_op(*op, ...) 这种
+// 写法要对着 &UnaryOp 解引用取值，没有 Copy 编译不过（E0507）。纯枚举、
+// 不带数据，加 Copy 完全安全，不影响任何已有用法（Copy 类型依然可以
+// 正常 .clone()）。
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum UnaryOp {
     Neg,
     Not,
@@ -379,9 +413,27 @@ pub enum IfKind {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Literal {
-    Int(i64),
-    Float(f64),
+    // 有符号整数
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    Int128(i128),
+    // 无符号整数
+    UInt8(u8),
+    UInt16(u16),
+    UInt32(u32),
+    UInt64(u64),
+    UInt128(u128),
+    // 平台相关
+    Isize(isize),
+    Usize(usize),
+    // 浮点数
+    Float16(f32),   // 存储为 f32，因为 Rust 没有原生 f16，但我们可以用 f32 模拟
+    Float32(f32),
+    Float64(f64),
     Bool(bool),
+    Char(char),
     String(String),
     Unit,
     // ===== 新增：bytes"..." 字节字符串字面量，类型是 &[u8] =====
@@ -390,7 +442,8 @@ pub enum Literal {
     ByteString(Vec<u8>),
 }
 
-#[derive(Debug, PartialEq, Clone)]
+// 关键修复：同 UnaryOp，补 Copy——simplify.rs 里 *op 解引用取值需要。
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -431,6 +484,22 @@ pub enum Type {
     Privacy(Box<Type>, PrivacyTag),
     SelfType,
     ConstIntArray(Vec<i64>),
+    // ===== 新增：元组类型 =====
+    // 之前这门语言完全没有元组这个概念——Type 里连 Tuple 变体都不存
+    // 在。新增字面量/模式匹配对元组的支持，必须先有对应的运行时类型
+    // 落点，不然"元组"就只是个没有类型的语法糖。跟 Struct(String) 不
+    // 同，元组没有名字，直接内联存各个位置的类型。
+    Tuple(Vec<Type>),
+    // ===== 新增：定长数组类型 [T; N] =====
+    // 跟已有的 Slice(Box<Type>) 是两回事：Slice 单独存在没有意义、必
+    // 须靠 Ref 借用（见 Slice 的注释——`&[T]`），Array 是"整体可以被
+    // 持有/传值的定长聚合"，不需要经过 Ref 才能作为一个值使用，语义上
+    // 更接近 Rust 的 `[T; N]`。跟 ConstIntArray(Vec<i64>) 也是两回事：
+    // ConstIntArray 存的是编译期已知的一串 i64 字面量（用于形状/常量
+    // 泛型参数那类场景），Array 描述的是"元素类型是 T、长度是 N 的普
+    // 通数组值的类型"，元素可以是任意 Type，不要求是整数、也不要求在
+    // 这里把每个元素的值都存下来。
+    Array(Box<Type>, usize),
     Ref {
         mutable: bool,
         inner: Box<Type>,
@@ -443,6 +512,28 @@ pub enum Type {
     // Box<[T]> 那种场景）不用再改类型结构。
     Slice(Box<Type>),
     Unit,
+    // ===== 新增：never 类型（底类型 ⊥）=====
+    // 表示"不会正常产生值"的表达式的类型：`return`/`break` 表达式本身、
+    // panic-only 的调用、以及没有 break 出口的 `loop { ... }` 都可以标
+    // 成 Never。它是所有类型的子类型（能隐式转换/统一到任意其它类型），
+    // 但这条"可以兼容任何类型"的统一规则属于类型检查算法，留给 sema 去
+    // 实现——ast 这一层只负责能把 `never` 关键字解析出的类型记下来。
+    // 之前 LackSlice 的注释里提到"禁止 T 是 never"，指的就是这个变体：
+    // 那条约束也是 sema 检查，这里不做限制。
+    Never,
+}
+
+impl Type {
+    // 从类型中提取隐私标签（如果有的话）。放在 Type 自己身上而不是某个
+    // pass 的私有函数里：“这个类型带不带隐私标签”本来就是 Type 的属性，
+    // 写成方法语义更直接，也方便 hir_builder.rs 之外的地方（比如以后
+    // elaborate.rs 要判断隐私标签）复用，不用各自再写一遍 match。
+    pub fn privacy_tag(&self) -> Option<PrivacyTag> {
+        match self {
+            Type::Privacy(_, tag) => Some(tag.clone()),
+            _ => None,
+        }
+    }
 }
 
 // ===== 隐私标签 =====

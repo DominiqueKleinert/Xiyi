@@ -1,18 +1,20 @@
 use crate::ast::*;
 use crate::hir::*;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 type BuildResult<T> = Result<T, String>;
+
+// privacy_tag() 现在定义在 ast.rs 的 impl Type 里（上一轮先临时放在这个
+// 文件是因为那次只同步到 hir_builder.rs，拿到 ast.rs 之后就该搬回它本该
+// 在的地方）。这里靠 `use crate::ast::*` 直接拿到这个方法，不用再自己声明。
 
 pub struct HirBuilder;
 
 impl HirBuilder {
-    // ===== 辅助函数：将 T 包装成 BuildResult<T> =====
     fn ok<T>(val: T) -> BuildResult<T> {
         Ok(val)
     }
 
-    // ===== 辅助函数：ast::GenericParam -> HIR 里统一用的 Vec<HirGenericParam> =====
     // 抽出来复用，避免 build_struct/build_enum/build_fn/build_implement/build_interface
     // 各写一份、以后 GenericParam 加新变体时到处漏改
     // 注：现在把 bounds 也透传进 HIR 了（ast::GenericParam::Type 已经带 bounds），
@@ -27,6 +29,83 @@ impl HirBuilder {
                 },
             })
             .collect()
+    }
+
+    // 通用 effect 合并 helper：接收任意一批 &HirExpr（数组字面量、Vec 迭代器、
+    // chain 起来的可选项……都行），取出各自的 effects 交给 EffectSet::merge。
+    // 之前 Call / EnumVariantConstruction / StructInit / ArrayLiteral / Match /
+    // If 等分支各自手写一份 `let mut child_effects: Vec<&EffectSet> = ...; for
+    // ... { child_effects.push(...) }`，现在统一走这一个函数。
+    fn merge_effects<'a, I>(exprs: I) -> EffectSet
+    where
+        I: IntoIterator<Item = &'a HirExpr>,
+    {
+        let refs: Vec<&EffectSet> = exprs.into_iter().map(|e| &e.effects).collect();
+        EffectSet::merge(&refs)
+    }
+
+    // Call / EnumVariantConstruction 的实参列表结构一样（都是 Vec<HirCallArg>），
+    // 从中取出各参数表达式的写法也完全一样，抽出来避免两处重复。
+    fn call_arg_expr(arg: &HirCallArg) -> &HirExpr {
+        match arg {
+            HirCallArg::Positional(e) => e,
+            HirCallArg::Named(_, e) => e,
+        }
+    }
+
+    fn merge_effects_from_call_args(args: &[HirCallArg]) -> EffectSet {
+        Self::merge_effects(args.iter().map(Self::call_arg_expr))
+    }
+
+    // Call / EnumVariantConstruction 中把 ast::CallArg 逐个 build 成
+    // HirCallArg 的逻辑也完全一样，一并抽出来。
+    fn build_call_args(
+        args: &[CallArg],
+        expr_types: &HashMap<usize, Type>,
+    ) -> BuildResult<Vec<HirCallArg>> {
+        args.iter()
+            .map(|arg| match arg {
+                CallArg::Positional(e) => {
+                    Self::ok(HirCallArg::Positional(Self::build_expr(e, expr_types)?))
+                }
+                CallArg::Named(name, e) => Self::ok(HirCallArg::Named(
+                    name.clone(),
+                    Self::build_expr(e, expr_types)?,
+                )),
+            })
+            .collect()
+    }
+
+    fn merge_effects_from_block(block: &HirBlock) -> EffectSet {
+        let mut merged = EffectSet::default();
+        for stmt in &block.stmts {
+            match stmt {
+                HirStmt::Expr { expr, .. } => merged.merge_with(&expr.effects),
+                HirStmt::Let { init, .. } => merged.merge_with(&init.effects),
+                HirStmt::Return { expr: Some(e), .. } => merged.merge_with(&e.effects),
+                HirStmt::Assign { target, expr, .. } => {
+                    merged.merge_with(&target.effects);
+                    merged.merge_with(&expr.effects);
+                }
+                HirStmt::While { cond, body, .. } => {
+                    merged.merge_with(&cond.effects);
+                    merged.merge_with(&Self::merge_effects_from_block(body));
+                }
+                HirStmt::For { iterable, body, .. } => {
+                    merged.merge_with(&iterable.effects);
+                    merged.merge_with(&Self::merge_effects_from_block(body));
+                }
+                HirStmt::Loop { body, .. } => {
+                    merged.merge_with(&Self::merge_effects_from_block(body));
+                }
+                HirStmt::UnsafeBlock { body, .. } => {
+                    merged.merge_with(&Self::merge_effects_from_block(body));
+                }
+                // Break 无子表达式，忽略
+                _ => {}
+            }
+        }
+        merged
     }
 
     pub fn build(
@@ -45,7 +124,7 @@ impl HirBuilder {
         for item in &program.items {
             match item {
                 Item::ModelDef(m) => models.push(Self::build_model(m, expr_types)?),
-                Item::FnDef(f) => fns.push(Self::build_fn(f, expr_types, None)?),
+                Item::FnDef(f) => fns.push(Self::build_fn(f, expr_types, false)?),
                 Item::StructDef(s) => structs.push(Self::build_struct(s)?),
                 Item::EnumDef(e) => enums.push(Self::build_enum(e)?),
                 Item::ConstDef(c) => consts.push(Self::build_const(c, expr_types)?),
@@ -81,7 +160,7 @@ impl HirBuilder {
         let functions = imp
             .functions
             .iter()
-            .map(|f| Self::build_fn(f, expr_types, None))
+            .map(|f| Self::build_fn(f, expr_types, false))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(HirImplement {
@@ -122,25 +201,26 @@ impl HirBuilder {
         m: &ModelDef,
         expr_types: &HashMap<usize, Type>,
     ) -> BuildResult<HirModel> {
-        let mut syms = Vec::new();
-        if let Some(forward) = m.functions.iter().find(|f| f.name == "forward") {
-            Self::collect_syms_from_type(&forward.return_type, &mut syms);
-            for param in &forward.params {
+        // 之前这里、下面的 training_context_required、privacy_eps 三处
+        // 各自 `m.functions.iter().find(|f| f.name == "forward")` 扫一遍，
+        // n 很小所以性能无所谓，但逻辑分散、改起来容易漏。这里只扫一次，
+        // 后面几处都复用同一个 forward。
+        let forward = m.functions.iter().find(|f| f.name == "forward");
+
+        // BTreeSet 天然去重 + 有序，省掉手写的 unique_syms.contains 检查
+        // 和最后的 sort。
+        let mut syms: BTreeSet<String> = BTreeSet::new();
+        if let Some(fwd) = forward {
+            Self::collect_syms_from_type(&fwd.return_type, &mut syms);
+            for param in &fwd.params {
                 Self::collect_syms_from_type(&Some(param.ty.clone()), &mut syms);
             }
         }
-        let mut unique_syms = Vec::new();
-        for s in syms {
-            if !unique_syms.contains(&s) {
-                unique_syms.push(s);
-            }
-        }
-        unique_syms.sort();
 
         // 注：这些 symbolic dims 来自 forward 的张量形状，不是用户写的 <T: Bound>，
         // 天生没有 bounds 概念。这里只是包一层 HirGenericParam 让类型跟其它
         // generic_params 字段保持一致，bounds 恒为空，不代表真的支持约束。
-        let generic_params = unique_syms
+        let generic_params = syms
             .into_iter()
             .map(|name| HirGenericParam {
                 name,
@@ -160,36 +240,28 @@ impl HirBuilder {
         let functions = m
             .functions
             .iter()
-            .map(|f| Self::build_fn(f, expr_types, Some(m.name.clone())))
+            .map(|f| Self::build_fn(f, expr_types, true))
             .collect::<Result<Vec<_>, _>>()?;
 
         let sensitivity = None;
 
-        // 检查是否需要 TrainingContext
-        let training_context_required = if let Some(forward) =
-            m.functions.iter().find(|f| f.name == "forward")
-        {
-            forward.params.iter().any(|p| {
-                matches!(&p.ty, Type::Privacy(_, PrivacyTag::Differential { .. }))
-            })
-        } else {
-            false
-        };
+        // 检查是否需要 TrainingContext（复用上面已经拿到的 forward）
+        let training_context_required = forward.map_or(false, |fwd| {
+            fwd.params
+                .iter()
+                .any(|p| matches!(&p.ty, Type::Privacy(_, PrivacyTag::Differential { .. })))
+        });
 
-        // 提取隐私预算 eps
-        let privacy_eps = if let Some(forward) =
-            m.functions.iter().find(|f| f.name == "forward")
-        {
-            forward.params.iter().find_map(|p| {
+        // 提取隐私预算 eps（同样复用 forward）
+        let privacy_eps = forward.and_then(|fwd| {
+            fwd.params.iter().find_map(|p| {
                 if let Type::Privacy(_, PrivacyTag::Differential { eps, delta: _ }) = &p.ty {
                     Some(eps.clone())
                 } else {
                     None
                 }
             })
-        } else {
-            None
-        };
+        });
 
         Ok(HirModel {
             name: m.name.clone(),
@@ -219,7 +291,7 @@ impl HirBuilder {
     fn build_fn(
         f: &FnDef,
         expr_types: &HashMap<usize, Type>,
-        model_owner: Option<String>,
+        in_model: bool,
     ) -> BuildResult<HirFn> {
         let params = f
             .params
@@ -232,7 +304,11 @@ impl HirBuilder {
 
         let body = Self::build_block(&f.body, expr_types)?;
         let return_type = f.return_type.clone();
-        let effects = EffectSet::default();
+        // 之前这里是 EffectSet::default()，等于所有函数的 effect 恒为
+        // false——这是 bug，不是"留给后面单独 pass 算"的占位符（目前
+        // 压根没有那样的 pass）。函数级 effect 应该是函数体里所有语句
+        // effect 的合并，直接复用 merge_effects_from_block。
+        let effects = Self::merge_effects_from_block(&body);
         let sensitivity = None;
 
         Ok(HirFn {
@@ -243,7 +319,7 @@ impl HirBuilder {
             body,
             effects,
             sensitivity,
-            is_forward: f.name == "forward" && model_owner.is_some(),
+            is_forward: f.name == "forward" && in_model,
         })
     }
 
@@ -335,10 +411,25 @@ impl HirBuilder {
         })
     }
 
+    // 把构造 HirExpr 时反复重复的 6 个字段收口成一个函数。privacy_tag
+    // 直接从传入的 ty 现取，调用方不用再单独维护一份 privacy_tag 变量。
+    // 注意：privacy_tag 必须在 ty 被移入结构体之前算出来，所以这里用
+    // let 先算好，不能写成 struct literal 里 `ty, privacy_tag: ty.privacy_tag()`
+    // 那种顺序——ty 字段先被移动，后面再借用就编译不过了。
+    fn mk_expr(kind: HirExprKind, ty: Type, effects: EffectSet, span: Span) -> HirExpr {
+        let privacy_tag = ty.privacy_tag();
+        HirExpr {
+            kind,
+            ty,
+            privacy_tag,
+            sensitivity: Sensitivity::Unknown,
+            effects,
+            span,
+        }
+    }
+
     fn build_expr(expr: &Expr, expr_types: &HashMap<usize, Type>) -> BuildResult<HirExpr> {
         let ty = expr_types.get(&expr.id).cloned().unwrap_or(Type::I32);
-        let privacy_tag = Self::extract_privacy_tag(&ty);
-        let sensitivity = Sensitivity::Unknown;
         let mut effects = EffectSet::default();
 
         let kind = match &expr.kind {
@@ -348,13 +439,7 @@ impl HirBuilder {
             ExprKind::BinaryOp { op, left, right } => {
                 let left = Self::build_expr(left, expr_types)?;
                 let right = Self::build_expr(right, expr_types)?;
-                effects = EffectSet {
-                    has_io: left.effects.has_io || right.effects.has_io,
-                    has_rng: left.effects.has_rng || right.effects.has_rng,
-                    has_ai: left.effects.has_ai || right.effects.has_ai,
-                    has_ffi: left.effects.has_ffi || right.effects.has_ffi,
-                    has_panic: left.effects.has_panic || right.effects.has_panic,
-                };
+                effects = Self::merge_effects([&left, &right]);
                 HirExprKind::BinaryOp {
                     op: op.clone(),
                     left: Box::new(left),
@@ -367,42 +452,10 @@ impl HirBuilder {
                 args,
                 is_method,
             } => {
-                let hir_args: Vec<HirCallArg> = args
-                    .iter()
-                    .map(|arg| match arg {
-                        CallArg::Positional(e) => {
-                            let expr = Self::build_expr(e, expr_types)?;
-                            Self::ok(HirCallArg::Positional(expr))
-                        }
-                        CallArg::Named(name, e) => {
-                            let expr = Self::build_expr(e, expr_types)?;
-                            Self::ok(HirCallArg::Named(name.clone(), expr))
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let hir_args = Self::build_call_args(args, expr_types)?;
+                effects = Self::merge_effects_from_call_args(&hir_args);
                 if func == "print" {
                     effects.has_io = true;
-                }
-                for arg in &hir_args {
-                    let e = match arg {
-                        HirCallArg::Positional(e) => e,
-                        HirCallArg::Named(_, e) => e,
-                    };
-                    if e.effects.has_io {
-                        effects.has_io = true;
-                    }
-                    if e.effects.has_rng {
-                        effects.has_rng = true;
-                    }
-                    if e.effects.has_ai {
-                        effects.has_ai = true;
-                    }
-                    if e.effects.has_ffi {
-                        effects.has_ffi = true;
-                    }
-                    if e.effects.has_panic {
-                        effects.has_panic = true;
-                    }
                 }
                 HirExprKind::Call {
                     qualifier: qualifier.clone(),
@@ -417,51 +470,7 @@ impl HirBuilder {
             }
             ExprKind::Block(block) => {
                 let hir_block = Self::build_block(block, expr_types)?;
-                for stmt in &hir_block.stmts {
-                    match stmt {
-                        HirStmt::Expr { expr, .. }
-                        | HirStmt::Let { init: expr, .. }
-                        | HirStmt::Return { expr: Some(expr), .. } => {
-                            if expr.effects.has_io {
-                                effects.has_io = true;
-                            }
-                            if expr.effects.has_rng {
-                                effects.has_rng = true;
-                            }
-                            if expr.effects.has_ai {
-                                effects.has_ai = true;
-                            }
-                            if expr.effects.has_ffi {
-                                effects.has_ffi = true;
-                            }
-                            if expr.effects.has_panic {
-                                effects.has_panic = true;
-                            }
-                        }
-                        HirStmt::UnsafeBlock { body, .. } => {
-                            for inner_stmt in &body.stmts {
-                                if let HirStmt::Expr { expr, .. } = inner_stmt {
-                                    if expr.effects.has_io {
-                                        effects.has_io = true;
-                                    }
-                                    if expr.effects.has_rng {
-                                        effects.has_rng = true;
-                                    }
-                                    if expr.effects.has_ai {
-                                        effects.has_ai = true;
-                                    }
-                                    if expr.effects.has_ffi {
-                                        effects.has_ffi = true;
-                                    }
-                                    if expr.effects.has_panic {
-                                        effects.has_panic = true;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                effects = Self::merge_effects_from_block(&hir_block);
                 HirExprKind::Block(hir_block)
             }
             ExprKind::StructInit {
@@ -475,26 +484,9 @@ impl HirBuilder {
                         Self::ok((name.clone(), expr))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                for (_, e) in &hir_fields {
-                    if e.effects.has_io {
-                        effects.has_io = true;
-                    }
-                    if e.effects.has_rng {
-                        effects.has_rng = true;
-                    }
-                    if e.effects.has_ai {
-                        effects.has_ai = true;
-                    }
-                    if e.effects.has_ffi {
-                        effects.has_ffi = true;
-                    }
-                    if e.effects.has_panic {
-                        effects.has_panic = true;
-                    }
-                }
+                effects = Self::merge_effects(hir_fields.iter().map(|(_, e)| e));
                 HirExprKind::StructInit {
                     struct_name: struct_name.clone(),
-                    // TODO(sema): 同 Call，ast 侧暂无显式泛型实参，先占位空 Vec
                     generic_args: Vec::new(),
                     fields: hir_fields,
                 }
@@ -513,13 +505,7 @@ impl HirBuilder {
             ExprKind::Range { start, end } => {
                 let start = Self::build_expr(start, expr_types)?;
                 let end = Self::build_expr(end, expr_types)?;
-                effects = EffectSet {
-                    has_io: start.effects.has_io || end.effects.has_io,
-                    has_rng: start.effects.has_rng || end.effects.has_rng,
-                    has_ai: start.effects.has_ai || end.effects.has_ai,
-                    has_ffi: start.effects.has_ffi || end.effects.has_ffi,
-                    has_panic: start.effects.has_panic || end.effects.has_panic,
-                };
+                effects = Self::merge_effects([&start, &end]);
                 HirExprKind::Range {
                     start: Box::new(start),
                     end: Box::new(end),
@@ -538,19 +524,8 @@ impl HirBuilder {
                 variant_name,
                 args,
             } => {
-                let hir_args: Vec<HirCallArg> = args
-                    .iter()
-                    .map(|arg| match arg {
-                        CallArg::Positional(e) => {
-                            let expr = Self::build_expr(e, expr_types)?;
-                            Self::ok(HirCallArg::Positional(expr))
-                        }
-                        CallArg::Named(name, e) => {
-                            let expr = Self::build_expr(e, expr_types)?;
-                            Self::ok(HirCallArg::Named(name.clone(), expr))
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let hir_args = Self::build_call_args(args, expr_types)?;
+                effects = Self::merge_effects_from_call_args(&hir_args);
 
                 HirExprKind::EnumVariantConstruction {
                     enum_name: enum_name.clone(),
@@ -570,24 +545,9 @@ impl HirBuilder {
                         expr: arm_expr,
                     });
                 }
-                effects = cond.effects.clone();
-                for arm in &arms {
-                    if arm.expr.effects.has_io {
-                        effects.has_io = true;
-                    }
-                    if arm.expr.effects.has_rng {
-                        effects.has_rng = true;
-                    }
-                    if arm.expr.effects.has_ai {
-                        effects.has_ai = true;
-                    }
-                    if arm.expr.effects.has_ffi {
-                        effects.has_ffi = true;
-                    }
-                    if arm.expr.effects.has_panic {
-                        effects.has_panic = true;
-                    }
-                }
+                effects = Self::merge_effects(
+                    std::iter::once(&cond).chain(arms.iter().map(|arm| &arm.expr)),
+                );
                 HirExprKind::Match {
                     cond: Box::new(cond),
                     arms,
@@ -614,39 +574,11 @@ impl HirBuilder {
                     .map(|e| Self::build_expr(e, expr_types))
                     .transpose()?
                     .map(Box::new);
-                effects = cond.effects.clone();
-                if then_expr.effects.has_io {
-                    effects.has_io = true;
-                }
-                if then_expr.effects.has_rng {
-                    effects.has_rng = true;
-                }
-                if then_expr.effects.has_ai {
-                    effects.has_ai = true;
-                }
-                if then_expr.effects.has_ffi {
-                    effects.has_ffi = true;
-                }
-                if then_expr.effects.has_panic {
-                    effects.has_panic = true;
-                }
-                if let Some(e) = &else_expr {
-                    if e.effects.has_io {
-                        effects.has_io = true;
-                    }
-                    if e.effects.has_rng {
-                        effects.has_rng = true;
-                    }
-                    if e.effects.has_ai {
-                        effects.has_ai = true;
-                    }
-                    if e.effects.has_ffi {
-                        effects.has_ffi = true;
-                    }
-                    if e.effects.has_panic {
-                        effects.has_panic = true;
-                    }
-                }
+                effects = Self::merge_effects(
+                    std::iter::once(&cond)
+                        .chain(std::iter::once(&then_expr))
+                        .chain(else_expr.as_deref()),
+                );
                 HirExprKind::If {
                     kind: if_kind.clone(),
                     cond: Box::new(cond),
@@ -659,51 +591,12 @@ impl HirBuilder {
                     .iter()
                     .map(|e| Self::build_expr(e, expr_types))
                     .collect::<Result<Vec<_>, _>>()?;
-                for e in &hir_elements {
-                    if e.effects.has_io {
-                        effects.has_io = true;
-                    }
-                    if e.effects.has_rng {
-                        effects.has_rng = true;
-                    }
-                    if e.effects.has_ai {
-                        effects.has_ai = true;
-                    }
-                    if e.effects.has_ffi {
-                        effects.has_ffi = true;
-                    }
-                    if e.effects.has_panic {
-                        effects.has_panic = true;
-                    }
-                }
+                effects = Self::merge_effects(hir_elements.iter());
                 HirExprKind::ArrayLiteral(hir_elements)
             }
             ExprKind::UnsafeBlock(unsafe_block) => {
                 let body = Self::build_block(&unsafe_block.body, expr_types)?;
-                for stmt in &body.stmts {
-                    match stmt {
-                        HirStmt::Expr { expr, .. }
-                        | HirStmt::Let { init: expr, .. }
-                        | HirStmt::Return { expr: Some(expr), .. } => {
-                            if expr.effects.has_io {
-                                effects.has_io = true;
-                            }
-                            if expr.effects.has_rng {
-                                effects.has_rng = true;
-                            }
-                            if expr.effects.has_ai {
-                                effects.has_ai = true;
-                            }
-                            if expr.effects.has_ffi {
-                                effects.has_ffi = true;
-                            }
-                            if expr.effects.has_panic {
-                                effects.has_panic = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                effects = Self::merge_effects_from_block(&body);
                 HirExprKind::UnsafeBlock {
                     kind: unsafe_block.kind.clone(),
                     body,
@@ -732,13 +625,7 @@ impl HirBuilder {
             ExprKind::Index { expr, index } => {
                 let base = Self::build_expr(expr, expr_types)?;
                 let idx = Self::build_expr(index, expr_types)?;
-                effects = EffectSet {
-                    has_io: base.effects.has_io || idx.effects.has_io,
-                    has_rng: base.effects.has_rng || idx.effects.has_rng,
-                    has_ai: base.effects.has_ai || idx.effects.has_ai,
-                    has_ffi: base.effects.has_ffi || idx.effects.has_ffi,
-                    has_panic: base.effects.has_panic || idx.effects.has_panic,
-                };
+                effects = Self::merge_effects([&base, &idx]);
                 HirExprKind::Index {
                     expr: Box::new(base),
                     index: Box::new(idx),
@@ -751,21 +638,7 @@ impl HirBuilder {
             ExprKind::LackSlice(ty) => HirExprKind::LackSlice(ty.clone()),
         };
 
-        Ok(HirExpr {
-            kind,
-            ty,
-            privacy_tag,
-            sensitivity,
-            effects,
-            span: Span::default(),
-        })
-    }
-
-    fn extract_privacy_tag(ty: &Type) -> Option<PrivacyTag> {
-        match ty {
-            Type::Privacy(_, tag) => Some(tag.clone()),
-            _ => None,
-        }
+        Ok(Self::mk_expr(kind, ty, effects, Span::default()))
     }
 
     fn build_struct(s: &StructDef) -> BuildResult<HirStruct> {
@@ -810,18 +683,18 @@ impl HirBuilder {
         })
     }
 
-    fn collect_syms_from_type(ty_opt: &Option<Type>, syms: &mut Vec<String>) {
+    fn collect_syms_from_type(ty_opt: &Option<Type>, syms: &mut BTreeSet<String>) {
         if let Some(ty) = ty_opt {
             Self::collect_syms_from_type_inner(ty, syms);
         }
     }
 
-    fn collect_syms_from_type_inner(ty: &Type, syms: &mut Vec<String>) {
+    fn collect_syms_from_type_inner(ty: &Type, syms: &mut BTreeSet<String>) {
         match ty {
             Type::Tensor { shape, .. } => {
                 for dim in shape {
                     if let ShapeDim::Sym(s) = dim {
-                        syms.push(s.clone());
+                        syms.insert(s.clone());
                     }
                 }
             }

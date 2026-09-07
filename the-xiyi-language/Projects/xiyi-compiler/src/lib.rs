@@ -9,8 +9,11 @@ pub mod hir;
 pub mod hir_builder;
 pub mod mir;
 pub mod mir_builder;
+pub mod control;
+pub mod borrow;
+pub mod monomorphic;
 pub mod simplify;
-pub mod elaborator;
+pub mod elaborate;
 pub mod codegen;
 
 pub use ast::*;

@@ -762,6 +762,7 @@ impl Parser {
             Some((Token::Bool, _)) => { self.next(); Ok(Type::Bool) }
             Some((Token::Char, _)) => { self.next(); Ok(Type::Char) }
             Some((Token::Str, _)) => { self.next(); Ok(Type::Str) }
+            Some((Token::Never, _)) => { self.next(); Ok(Type::Never) }
             Some((Token::SelfType, _)) => { self.next(); Ok(Type::SelfType) }
             Some((Token::LParen, _)) => {
                 self.next(); // consume '('
@@ -1560,7 +1561,7 @@ impl Parser {
                 let num = value.parse::<i64>().unwrap();
                 Ok(Expr {
                     id: self.next_expr_id(),
-                    kind: ExprKind::Literal(Literal::Int(num)),
+                    kind: ExprKind::Literal(Literal::Int32(num)),
                 })
             }
             Some((Token::Float, value)) => {
@@ -1568,7 +1569,7 @@ impl Parser {
                 let num = value.parse::<f64>().unwrap();
                 Ok(Expr {
                     id: self.next_expr_id(),
-                    kind: ExprKind::Literal(Literal::Float(num)),
+                    kind: ExprKind::Literal(Literal::Float64(num)),
                 })
             }
             Some((Token::String, value)) => {

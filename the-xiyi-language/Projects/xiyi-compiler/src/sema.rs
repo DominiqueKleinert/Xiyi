@@ -456,7 +456,7 @@ impl TypeChecker {
 
     fn eval_const_int_expr(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
-            ExprKind::Literal(Literal::Int(v)) => Some(*v),
+            ExprKind::Literal(Literal::Int32(v)) => Some(*v),
             ExprKind::Unary { op: UnaryOp::Neg, expr } => {
                 self.eval_const_int_expr(expr).map(|v| -v)
             }
@@ -839,7 +839,7 @@ impl TypeChecker {
         // 放宽所有 I32——这样真正的 i32 变量跟 u128 变量比较时，还是会被
         // 正确地拦下来，不会被误放行。
         fn is_int_literal(e: &Expr) -> bool {
-            matches!(e.kind, ExprKind::Literal(Literal::Int(_)))
+            matches!(e.kind, ExprKind::Literal(Literal::Int32(_)))
         }
         let left_is_literal = is_int_literal(left_expr);
         let right_is_literal = is_int_literal(right_expr);
@@ -1046,6 +1046,7 @@ impl TypeChecker {
             // 是否一致），此时 T 应该被当成一个不透明的抽象类型，不能悄悄
             // 跟任何具体类型相等。真正“T 可以绑定成任意具体类型”这件事，
             // 只发生在调用点/构造点，交给下面的 unify_type，不要混进这里。
+            (Type::Never, _) | (_, Type::Never) => true,
             (Type::TypeParam(n1), Type::TypeParam(n2)) => n1 == n2,
             _ => false,
         }
@@ -1228,7 +1229,7 @@ impl TypeChecker {
             // （目前已绑定的泛型参数也可能已经把 expected_ty 具体化成这类
             // 类型），字面量应该让步迁就真实类型。
             let resolved_expected = self.substitute_type(expected_ty, &bindings);
-            let effective_arg_ty = if matches!(arg_expr.kind, ExprKind::Literal(Literal::Int(_)))
+            let effective_arg_ty = if matches!(arg_expr.kind, ExprKind::Literal(Literal::Int32(_)))
                 && self.is_numeric_type(&self.strip_privacy(&resolved_expected))
             {
                 resolved_expected.clone()
@@ -1376,7 +1377,7 @@ impl TypeChecker {
             // 真实类型——跟 check_binary_op 里对字面量的处理是同一个道理，
             // 只是那次只覆盖了二元运算，没覆盖到结构体字段初始化这条独立
             // 路径。
-            let effective_ty = if matches!(field_expr.kind, ExprKind::Literal(Literal::Int(_)))
+            let effective_ty = if matches!(field_expr.kind, ExprKind::Literal(Literal::Int32(_)))
                 && self.is_numeric_type(&self.strip_privacy(&expected_ty))
             {
                 expected_ty.clone()
@@ -1445,7 +1446,7 @@ impl TypeChecker {
             // 运算的一侧、枚举变体参数）才会被特殊处理，`if` 分支这种
             // "字面量被 if 包了一层"的情况完全没人管，这里先把最基础的
             // 一层补上，供下面 If 分支递归调用时使用。
-            (ExprKind::Literal(Literal::Int(_)), Some(expected_ty))
+            (ExprKind::Literal(Literal::Int32(_)), Some(expected_ty))
                 if self.is_numeric_type(&self.strip_privacy(expected_ty)) =>
             {
                 Ok(expected_ty.clone())
@@ -1455,7 +1456,7 @@ impl TypeChecker {
             // 认一下，不然 `let sign: i128 = if cond { -1 } else { 1 };`
             // 这种写法里的 -1 永远没法迁就 i128。
             (ExprKind::Unary { op: UnaryOp::Neg, expr: inner }, Some(expected_ty))
-                if matches!(inner.kind, ExprKind::Literal(Literal::Int(_)))
+                if matches!(inner.kind, ExprKind::Literal(Literal::Int32(_)))
                     && self.is_signed_numeric_type(&self.strip_privacy(expected_ty)) =>
             {
                 Ok(expected_ty.clone())
@@ -1528,8 +1529,8 @@ impl TypeChecker {
     fn check_expr(&mut self, expr: &Expr) -> Result<Type, String> {
         let result = match &expr.kind {
             ExprKind::Literal(lit) => match lit {
-                Literal::Int(_) => Ok(Type::I32),
-                Literal::Float(_) => Ok(Type::F32),
+                Literal::Int32(_) => Ok(Type::I32),
+                Literal::Float32(_) => Ok(Type::F32),
                 Literal::Bool(_) => Ok(Type::Bool),
                 Literal::String(_) => Ok(Type::Str),
                 Literal::Unit => Ok(Type::Unit),
@@ -1751,7 +1752,7 @@ impl TypeChecker {
                             arg_ty
                         ));
                     }
-                    return Ok(Type::Unit);
+                    return Ok(Type::Never);    // 这里返回 Type::Never，表示 panic 永远不会返回
                 }
 
                 // `from_utf8_unchecked(bytes)`——同样是标准库里用了、但从没
@@ -2463,6 +2464,9 @@ impl TypeChecker {
                             self.scopes.last_mut().unwrap().insert(binding.clone(), binding_ty);
                         }
                         Pattern::Wildcard => {}
+                        _ => {
+                            return Err(format!("unsupported pattern in match: {:?}", arm.pattern));
+                        }
                     }
 
                     let is_panic_arm = matches!(
