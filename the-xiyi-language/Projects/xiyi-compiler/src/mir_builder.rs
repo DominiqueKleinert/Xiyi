@@ -196,7 +196,7 @@ impl MirBuilder {
         // 路径都会发散，这里只是让 MIR 层的终止器诚实地反映这条约定，
         // 不负责重新验证它。
         if builder.current_terminator_is_placeholder() {
-            let term = if matches!(f.return_type, Some(Type::Never)) {
+            let term = if let Some(Type::Never) = f.return_type {
                 MirTerminator::Unreachable
             } else {
                 MirTerminator::Return(ret)
@@ -352,7 +352,10 @@ impl MirBuilder {
     }
 
     fn current_terminator_is_placeholder(&self) -> bool {
-        matches!(self.blocks[self.current_block].terminator, MirTerminator::Unreachable)
+        match self.blocks[self.current_block].terminator {
+            MirTerminator::Unreachable => true,
+            _ => false,
+        }
     }
 
     // -------- Block / Stmt --------
@@ -399,7 +402,7 @@ impl MirBuilder {
                 // 进一个实际上已经不可达的块里，跟真实控制流对不上。
                 // 之前没有真正的 Type::Never 时这里根本判断不出来，只能
                 // 放任不管，这是当初的权宜之计之一，现在补上。
-                if matches!(expr.ty, Type::Never) {
+                if let Type::Never = expr.ty {
                     self.set_terminator(MirTerminator::Unreachable);
                     let next = self.new_block();
                     self.switch_to_block(next);
@@ -766,7 +769,10 @@ impl MirBuilder {
                         // 留到 codegen 生成出编译不过（或者更糟、能编译但
                         // 语义不对）的 Rust 代码才发现。
                         debug_assert_eq!(
-                            matches!(expr.ty, Type::Never),
+                            match expr.ty {
+                                Type::Never => true,
+                                _ => false,
+                            },
                             intrinsic.diverges(),
                             "intrinsic `{}` 的签名声明的发散性跟 sema 算出的表达式类型对不上",
                             func
@@ -871,7 +877,10 @@ impl MirBuilder {
 
                 // ---------- Then 分支 ----------
                 self.switch_to_block(then_block);
-                let then_diverges = matches!(then_expr.ty, Type::Never);
+                let then_diverges = match then_expr.ty {
+                    Type::Never => true,
+                    _ => false,
+                };
                 let then_operand = self.build_expr(then_expr, shared)?;
                 if then_diverges {
                     self.set_terminator(MirTerminator::Unreachable);
@@ -892,7 +901,10 @@ impl MirBuilder {
                 self.switch_to_block(else_block);
                 match else_expr {
                     Some(e) => {
-                        let else_diverges = matches!(e.ty, Type::Never);
+                        let else_diverges = match e.ty {
+                            Type::Never => true,
+                            _ => false,
+                        };
                         let else_operand = self.build_expr(e, shared)?;
                         if else_diverges {
                             self.set_terminator(MirTerminator::Unreachable);
@@ -1295,7 +1307,10 @@ impl MirBuilder {
                                 self.moved.insert(self.current_ssa(cond_temp));
                             }
 
-                            let arm_diverges = matches!(arm_expr.ty, Type::Never);
+                            let arm_diverges = match arm_expr.ty {
+                                Type::Never => true,
+                                _ => false,
+                            };
                             let operand = self.build_expr(arm_expr, shared)?;
                             if arm_diverges {
                                 self.set_terminator(MirTerminator::Unreachable);
@@ -1433,7 +1448,10 @@ impl MirBuilder {
 
                         for (block, arm_expr) in arm_infos {
                             self.switch_to_block(block);
-                            let arm_diverges = matches!(arm_expr.ty, Type::Never);
+                            let arm_diverges = match arm_expr.ty {
+                                Type::Never => true,
+                                _ => false,
+                            };
                             let operand = self.build_expr(arm_expr, shared)?;
                             if arm_diverges {
                                 self.set_terminator(MirTerminator::Unreachable);

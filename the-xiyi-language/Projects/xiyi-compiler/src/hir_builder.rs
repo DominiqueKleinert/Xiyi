@@ -246,10 +246,13 @@ impl HirBuilder {
         let sensitivity = None;
 
         // 检查是否需要 TrainingContext（复用上面已经拿到的 forward）
+        // 关键修复：改回显式 match，不用 matches! 宏——项目里明确规定不用
+        // Rust 的任何宏（包括 matches!）。
         let training_context_required = forward.map_or(false, |fwd| {
-            fwd.params
-                .iter()
-                .any(|p| matches!(&p.ty, Type::Privacy(_, PrivacyTag::Differential { .. })))
+            fwd.params.iter().any(|p| match &p.ty {
+                Type::Privacy(_, PrivacyTag::Differential { .. }) => true,
+                _ => false,
+            })
         });
 
         // 提取隐私预算 eps（同样复用 forward）

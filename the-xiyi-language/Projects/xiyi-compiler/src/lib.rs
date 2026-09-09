@@ -3,7 +3,8 @@ pub mod lexer;
 pub mod ast;
 pub mod parser;
 pub mod intrinsic;
-pub mod sema;
+#[path = "semantic/module.rs"]
+pub mod semantic;
 pub mod calc;
 pub mod hir;
 pub mod hir_builder;
@@ -22,7 +23,7 @@ pub use ast::*;
 mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
-    use crate::sema::TypeChecker;
+    use crate::semantic::TypeChecker;
 
     #[test]
     fn test_lexer_basic() {

@@ -317,11 +317,12 @@ impl Codegen {
                     _ => None,
                 };
                 let all_same_base = dest_base.is_some() && values.iter().all(|(_, op)| {
-                    matches!(
-                        op,
-                        MirOperand::Move(MirPlace::Ssa(s)) | MirOperand::Copy(MirPlace::Ssa(s))
-                        if Some(s.base_id) == dest_base
-                    )
+                    match op {
+                        MirOperand::Move(MirPlace::Ssa(s)) | MirOperand::Copy(MirPlace::Ssa(s)) => {
+                            Some(s.base_id) == dest_base
+                        }
+                        _ => false,
+                    }
                 });
                 if all_same_base {
                     "    // phi: 各分支已经把值写进了同一个折叠后的变量，这里不需要再生成代码\n".to_string()
