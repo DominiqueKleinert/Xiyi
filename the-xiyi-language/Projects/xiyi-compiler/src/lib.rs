@@ -3,18 +3,20 @@ pub mod lexer;
 pub mod ast;
 pub mod parser;
 pub mod intrinsic;
-#[path = "semantic/module.rs"]
-pub mod semantic;
-pub mod calc;
 pub mod hir;
 pub mod hir_builder;
+#[path = "semantic/module.rs"]
+pub mod semantic;
+pub mod elaborate;
 pub mod mir;
 pub mod mir_builder;
+pub mod state;
+pub mod guide;
+pub mod calc;
 pub mod control;
 pub mod borrow;
 pub mod monomorphic;
 pub mod simplify;
-pub mod elaborate;
 pub mod codegen;
 
 pub use ast::*;

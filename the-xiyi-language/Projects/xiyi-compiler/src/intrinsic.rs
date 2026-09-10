@@ -412,3 +412,93 @@ pub fn get_constant(name: IntrinsicConst) -> Option<&'static Constant> {
 pub fn is_intrinsic(s: &str) -> bool {
     IntrinsicFn::from_str(s).is_some() || IntrinsicConst::from_str(s).is_some()
 }
+
+// ===== 从 mir_builder.rs 搬过来的内建调用识别逻辑 =====
+//
+// 这两个函数原来是 mir_builder.rs 的 build_expr_rvalue 里
+// HirExprKind::Call 分支内联的两段代码。之所以能搬过来而不用把
+// MirBuilder 整个搬过来、也不用让这个文件反过来认识 mir.rs 的类型：
+// 这两段逻辑其实只需要"这次调用长什么样"（func/qualifier/is_method/
+// 参数个数）和 MirBuilder 当时的两个状态位（in_forward/unsafe_depth），
+// 不需要真的持有 &mut MirBuilder，也不产出任何 MIR 值——常量引用只
+// 返回一个名字字符串（由调用方自己包成 MirPlace::Static），内建函数
+// 检测只返回"是不是、是哪个"，真正构造 MirRvalue::Call 的代码留在
+// mir_builder.rs（那部分对内建调用和普通调用是共用的，拆出来意义不大）。
+
+/// 尝试把一次零参裸调用识别成内建关联常量的引用（比如 `i128::MAX`）。
+/// 命中返回这个常量的规范名字（用来构造 MirPlace::Static），命中不了
+/// （不满足零参裸调用的形状，或者名字根本不是已知常量）返回 None，
+/// 调用方按普通调用继续处理——常量引用语法上就是一个裸名字，不可能
+/// 同时是方法调用或带参数，所以先拿这两个条件筛一遍。
+pub fn try_resolve_constant_ref(
+    qualifier: &Option<String>,
+    func: &str,
+    is_method: bool,
+    arg_count: usize,
+) -> Option<&'static str> {
+    if qualifier.is_some() || is_method || arg_count != 0 {
+        return None;
+    }
+    let name = IntrinsicConst::from_str(func)?;
+    get_constant(name).map(|c| c.name)
+}
+
+/// 校验并识别一次调用是不是真正的内建/固有函数。
+/// - 不是内建函数（用户自定义函数/普通调用）→ `Ok((false, None))`，
+///   调用方按普通函数调用继续处理。
+/// - 是内建函数但触发了限制（model 块里用了不允许的副作用函数、
+///   unsafe 函数在 unsafe 块外被调用）→ `Err(...)`。
+/// - 是内建函数且检查通过 → `Ok((true, Some(名字)))`。
+///
+/// `in_forward`/`unsafe_depth` 是 MirBuilder 自己的构建期状态，这两条
+/// 检查天生依赖它们，所以按值传进来，而不是把 MirBuilder 整个传进来
+/// ——这个文件不需要认识 MirBuilder 长什么样。`expr_diverges` 同理，
+/// 是调用方已经从 HIR 表达式的 `ty` 字段（`Type::Never`）算好的结果，
+/// 传一个 bool 进来即可，不用为了这一条 debug 断言让这个文件认识
+/// hir.rs 的类型。
+pub fn resolve_intrinsic_call(
+    qualifier: &Option<String>,
+    func: &str,
+    is_method: bool,
+    in_forward: bool,
+    unsafe_depth: usize,
+    expr_diverges: bool,
+) -> Result<(bool, Option<IntrinsicFn>), String> {
+    if qualifier.is_some() || is_method {
+        return Ok((false, None));
+    }
+    let name = match IntrinsicFn::from_str(func) {
+        Some(n) => n,
+        None => return Ok((false, None)),
+    };
+    let intrinsic = match get_intrinsic(name) {
+        Some(i) => i,
+        None => return Ok((false, None)),
+    };
+
+    if in_forward && !intrinsic.allowed_in_model {
+        return Err(format!(
+            "error[MD001]: side-effect `{}` is not allowed in model block (forward method)",
+            func
+        ));
+    }
+    if intrinsic.requires_unsafe && unsafe_depth == 0 {
+        return Err(format!(
+            "call to unsafe intrinsic `{}` requires an `unsafe` block or `verify unsafe`",
+            func
+        ));
+    }
+
+    // 交叉校验：sema 给这个调用表达式算出来的发散性和 intrinsic 注册表
+    // 自己声明的签名，理论上必须给出一致的答案（比如 panic() 应该是
+    // Type::Never，跟 Intrinsic::diverges() 一致）。只在 debug 构建里
+    // 检查，正常运行零开销。
+    debug_assert_eq!(
+        expr_diverges,
+        intrinsic.diverges(),
+        "intrinsic `{}` 的签名声明的发散性跟 sema 算出的表达式类型对不上",
+        func
+    );
+
+    Ok((true, Some(name)))
+}

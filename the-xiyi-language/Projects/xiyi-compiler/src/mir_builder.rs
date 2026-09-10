@@ -1,48 +1,64 @@
 // mir_builder.rs
+//
+// 拆分说明：这个文件原来快 1520 行，臃肿到难以维护。现在拆成四份：
+//   - intrinsic.rs：内建常量/内建函数的识别逻辑（不需要 &mut MirBuilder
+//     本身，只需要几个状态位，见 intrinsic.rs 里新加那两个函数的注释）。
+//   - state.rs：Local / SSA / Scope / 基本块这些"构建期状态"怎么增删。
+//   - guide.rs：Place（左值）怎么从一个 HIR 表达式构造出来。
+//   - 这个文件：剩下的——build() 入口、build_fn、以及真正的"HIR 节点
+//     -> MIR 节点"翻译主体（build_block/build_stmt/build_expr/
+//     build_expr_rvalue/build_call_arg）。
+//
+// SharedContext/MirBuilder 的字段从私有改成 pub(crate)：拆到 state.rs/
+// guide.rs 之后，那两个文件是跟这个文件平级的顶层模块（不是子模块），
+// 平级模块之间访问私有字段过不了编译，只能放宽到 crate 内可见——用
+// pub(crate) 而不是整个 pub，是不想让这些内部字段被拆分之外的、
+// crate 外部的使用者（这个 crate 本来就是被 main.rs 当库用的）看到，
+// 它们纯粹是构建过程的内部细节。
 use crate::ast::{Pattern, Type};
 use crate::hir::*;
 use crate::mir::*;
 use std::collections::HashMap;
-use crate::intrinsic::{IntrinsicFn, IntrinsicConst, get_intrinsic, get_constant};
+use crate::intrinsic::IntrinsicFn;
 
 // ===== 跨函数共享的只读上下文（build() 里构建一次，每个函数复用） =====
-struct SharedContext {
+pub(crate) struct SharedContext {
     // struct_name -> (field_name -> field_ty)，FieldAccess 查真实字段
     // 类型用，不再靠猜。
-    struct_fields: HashMap<String, HashMap<String, Type>>,
+    pub(crate) struct_fields: HashMap<String, HashMap<String, Type>>,
     // variant_name -> enum_name（要求全局唯一）。裸 Ok/Err/Some/None 这类
     // 不带 :: 前缀的写法，语法上跟普通函数调用（HirExprKind::Call）长得
     // 一模一样，sema.rs 那边靠"在所有已注册枚举里找恰好一个同名变体"
     // 识别出来，但那个识别结果只体现在类型检查上，没有改写 HIR 节点
     // 本身——MIR 构建这里得重新做一遍同样的查找，才能正确区分
     // "Err(())" 这种裸枚举变体构造和真正的函数调用。
-    variant_to_enum: HashMap<String, String>,
-    variant_indices: HashMap<(String, String), usize>,
+    pub(crate) variant_to_enum: HashMap<String, String>,
+    pub(crate) variant_indices: HashMap<(String, String), usize>,
     // 关键新增：(enum_name, variant_name) -> 这个变体自己声明的 payload
     // 类型。EnumVariantWithBinding 模式（`Ok(v) => ...` 里的 v）要把
     // payload 解出来绑定成一个新的 MirLocal，而 MirLocal.ty 是必填
     // 字段——不能瞎猜一个类型糊弄过去，也没法从 Switch 那边反推出来
     // （Switch 只留了 i64 下标，早就不知道原来的 payload 长什么样了），
     // 只能在这里从 hir.enums 的原始声明里查。
-    variant_payload_types: HashMap<(String, String), Type>,
+    pub(crate) variant_payload_types: HashMap<(String, String), Type>,
 }
 
 pub struct MirBuilder {
-    locals: Vec<MirLocal>,
-    blocks: Vec<MirBlock>,
-    current_block: usize,
-    scope: Vec<HashMap<String, usize>>, // 变量名 -> local id
-    scope_vars: Vec<Vec<usize>>,
-    unsafe_depth: usize,
-    in_forward: bool,
-    ssa_versions: HashMap<usize, u32>,
+    pub(crate) locals: Vec<MirLocal>,
+    pub(crate) blocks: Vec<MirBlock>,
+    pub(crate) current_block: usize,
+    pub(crate) scope: Vec<HashMap<String, usize>>, // 变量名 -> local id
+    pub(crate) scope_vars: Vec<Vec<usize>>,
+    pub(crate) unsafe_depth: usize,
+    pub(crate) in_forward: bool,
+    pub(crate) ssa_versions: HashMap<usize, u32>,
     // 关键修复（找回上一轮被回退掉的东西）：这一版是从更早的快照分支
     // 出来重新改的，上一轮为了配合真正的 Drop 语义加的 `moved` 追踪
     // （连带 pop_scope/Return 那两处修复）整个不见了，pop_scope 现在
     // 又是无条件对作用域里的每个变量插 Drop——回到了"对已经被移动走
     // （哪怕只是部分移动）的值重复调用 drop()，生成的 Rust 编译不过"
     // 这个问题。理由和之前完全一样，不重复展开，直接照抄那一轮的实现。
-    moved: std::collections::HashSet<SsaLocal>,
+    pub(crate) moved: std::collections::HashSet<SsaLocal>,
 }
 
 impl MirBuilder {
@@ -212,150 +228,6 @@ impl MirBuilder {
             body: MirBody { locals: builder.locals, blocks: builder.blocks },
             effect_set: f.effects.clone(),
         })
-    }
-
-    // -------- 局部变量 --------
-    fn new_local(&mut self, name: Option<String>, ty: Type, mutable: bool, add_to_scope: bool) -> usize {
-        let id = self.locals.len();
-        self.locals.push(MirLocal { id, name, ty, mutable, persist: false, is_param: false });
-        if add_to_scope {
-            self.scope_vars.last_mut().unwrap().push(id);
-        }
-        id
-    }
-
-    // 关键新增：专门给函数参数用——is_param: true，codegen.rs 靠这个
-    // 字段知道"这个 local 不用重新 let 声明，Rust 函数签名里已经有
-    // 同名的绑定了"。参数永远不是 persist（persist 是给 model 块里
-    // `persist let`/`persist var` 用的，跟参数是两回事），也不需要
-    // mutable（函数体内要重新赋值的话，语言层面应该是 `let mut x = 参数`
-    // 这种显式重绑定，走的是普通 new_local，不是这里）。
-    fn new_param_local(&mut self, name: String, ty: Type) -> usize {
-        let id = self.locals.len();
-        self.locals.push(MirLocal { id, name: Some(name), ty, mutable: false, persist: false, is_param: true });
-        id
-    }
-
-    fn new_persist_local(&mut self, name: Option<String>, ty: Type, mutable: bool) -> usize {
-        let id = self.locals.len();
-        self.locals.push(MirLocal { id, name, ty, mutable, persist: true, is_param: false });
-        self.scope_vars.last_mut().unwrap().push(id);
-        id
-    }
-
-    fn new_version(&mut self, base_id: usize) -> u32 {
-        let ver = self.ssa_versions.get(&base_id).copied().unwrap_or(0) + 1;
-        self.ssa_versions.insert(base_id, ver);
-        ver
-    }
-
-    fn new_temp(&mut self, ty: Type) -> usize {
-        self.new_local(None, ty, false, true)
-    }
-
-    fn current_ssa(&self, base_id: usize) -> SsaLocal {
-        let version = self.ssa_versions.get(&base_id).copied().unwrap_or(0);
-        SsaLocal { base_id, version }
-    }
-
-    // 关键新增：Pattern::IntLiteral 只存了一个裸 i64（这是 ast.rs 里
-    // Pattern 自己的限制，还没跟着这一轮 Literal 拆分成按位宽/符号
-    // 区分的一堆变体一起升级——也就是说目前没法用字面量模式匹配超出
-    // i64 范围的 i128/u128 值，这是个已知的、比这次修复范围更大的
-    // 缺口，这里先不动 ast.rs，只保证"i64 范围内的值，按 discr 的具体
-    // 类型转换成正确的 Literal 变体"这件事是对的）。
-    fn int_literal_for_type(v: i64, ty: &Type) -> Result<Literal, String> {
-        Ok(match ty {
-            Type::I8 => Literal::Int8(v as i8),
-            Type::I16 => Literal::Int16(v as i16),
-            Type::I32 => Literal::Int32(v as i32),
-            Type::I64 => Literal::Int64(v),
-            Type::I128 => Literal::Int128(v as i128),
-            Type::U8 => Literal::UInt8(v as u8),
-            Type::U16 => Literal::UInt16(v as u16),
-            Type::U32 => Literal::UInt32(v as u32),
-            Type::U64 => Literal::UInt64(v as u64),
-            Type::U128 => Literal::UInt128(v as u128),
-            other => return Err(format!(
-                "match 条件是整数类型，但字面量模式配的类型是 {:?}——不是任何已知的整数类型，\
-                 这本该在 sema 阶段就被拦下",
-                other
-            )),
-        })
-    }
-
-    // -------- 作用域 --------
-    fn push_scope(&mut self) {
-        self.scope.push(HashMap::new());
-        self.scope_vars.push(Vec::new());
-    }
-    fn pop_scope(&mut self) {
-        if let Some(ids) = self.scope_vars.pop() {
-            for id in ids {
-                let ssa = self.current_ssa(id);
-                // 关键修复（找回上一轮的修复）：不能对作用域里的每个
-                // 变量无条件插 Drop——如果这个变量的当前版本已经在这个
-                // 作用域内被"消费"过（完整读取过一次，或者被当成
-                // Field/Index/EnumPayload 的 base 部分移动过），再补一条
-                // Drop 就是对一个已经移动走的值重复使用，生成的 Rust 会
-                // 是 "use of (partially) moved value"，编译不过。典型
-                // 场景：`match p { Point { x, y } => x }`——x 被直接当成
-                // 匹配结果读出去了，不能再 Drop 一次；`Ok(v) => v`、块尾
-                // 直接返回一个局部变量，都是同一类问题。见
-                // MirBuilder.moved 字段的说明，以及下面几处往里登记的
-                // 地方。
-                if !self.moved.contains(&ssa) {
-                    self.push_stmt(MirStmt::Drop { place: MirPlace::Ssa(ssa) });
-                }
-            }
-        }
-        self.scope.pop();
-    }
-    fn bind(&mut self, name: String, id: usize) {
-        self.scope.last_mut().unwrap().insert(name, id);
-    }
-    fn lookup(&self, name: &str) -> Option<usize> {
-        for scope in self.scope.iter().rev() {
-            if let Some(id) = scope.get(name) {
-                return Some(*id);
-            }
-        }
-        None
-    }
-
-    // -------- 基本块 --------
-    // 关键设计：块在用到之前就先创建好（占位终止器是 Unreachable），
-    // 之后随时可以用 id 引用它、往里面塞语句，最后再补上真正的终止器。
-    // 这是为了支持 if/while 这类需要"提前知道 then/else 块的 id 才能
-    // 设置当前块的跳转目标"的控制流——不这样做的话，构建顺序会陷入
-    // "先有鸡还是先有蛋"的死结。
-    fn new_block(&mut self) -> usize {
-        let id = self.blocks.len();
-        self.blocks.push(MirBlock {
-            id,
-            stmts: Vec::new(),
-            terminator: MirTerminator::Unreachable,
-        });
-        id
-    }
-
-    fn switch_to_block(&mut self, id: usize) {
-        self.current_block = id;
-    }
-
-    fn push_stmt(&mut self, stmt: MirStmt) {
-        self.blocks[self.current_block].stmts.push(stmt);
-    }
-
-    fn set_terminator(&mut self, term: MirTerminator) {
-        self.blocks[self.current_block].terminator = term;
-    }
-
-    fn current_terminator_is_placeholder(&self) -> bool {
-        match self.blocks[self.current_block].terminator {
-            MirTerminator::Unreachable => true,
-            _ => false,
-        }
     }
 
     // -------- Block / Stmt --------
@@ -539,60 +411,14 @@ impl MirBuilder {
         }
     }
 
-    // -------- Place（左值） --------
-    fn build_place(&mut self, expr: &HirExpr, shared: &SharedContext) -> Result<MirPlace, String> {
-        match &expr.kind {
-            HirExprKind::Ident(name) => {
-                let id = self.lookup(name).ok_or_else(|| format!("undefined variable `{}`", name))?;
-                Ok(MirPlace::Ssa(self.current_ssa(id)))
-            }
-            HirExprKind::FieldAccess { struct_expr, field_name } => {
-                let base = self.build_place(struct_expr, shared)?;
-                Ok(MirPlace::Field { base: Box::new(base), field: field_name.clone() })
-            }
-            HirExprKind::Index { expr: base, index } => {
-                let base_place = self.build_place(base, shared)?;
-                let index_operand = self.build_expr(index, shared)?;
-                Ok(MirPlace::Index { base: Box::new(base_place), index: Box::new(index_operand) })
-            }
-            _ => Err(format!(
-                "internal error: {:?} is not a valid assignment target \
-                 (sema.rs 的 is_assignable 应该已经拦住了这种情况，走到这里说明两边检查不一致)",
-                expr.kind
-            )),
-        }
-    }
-
-    /// 从 FieldAccess 的 struct_expr 自身携带的类型信息（sema 阶段已经
-    /// 解析好），查这个结构体真正定义里的哪个字段名（目前 build_place
-    /// 没有用到这个查找结果——MirPlace::Field 只存字段名字符串，类型
-    /// 由 codegen 需要时再去 MirProgram.structs 里查，不在 Place 上
-    /// 冗余缓存一份，避免跟结构体定义各说各话）。这个函数先保留，等
-    /// codegen 真正需要"构建期就确定字段类型"的场景时再启用。
-    #[allow(dead_code)]
-    fn lookup_field_type(&self, struct_expr: &HirExpr, field_name: &str, shared: &SharedContext) -> Type {
-        let struct_name = match &struct_expr.ty {
-            Type::Struct(name) => name.clone(),
-            Type::Generic(name, _) => name.clone(),
-            Type::Ref { inner, .. } => match inner.as_ref() {
-                Type::Struct(name) => name.clone(),
-                Type::Generic(name, _) => name.clone(),
-                _ => return Type::Unit,
-            },
-            _ => return Type::Unit,
-        };
-        shared
-            .struct_fields
-            .get(&struct_name)
-            .and_then(|fields| fields.get(field_name))
-            .cloned()
-            .unwrap_or(Type::Unit)
-    }
-
     // -------- Expr --------
     // build_expr：求值一个表达式，结果materialize 成一个 MirOperand
     // （字面量直接返回 Constant，否则落进临时变量返回 Copy/Move）。
-    fn build_expr(&mut self, expr: &HirExpr, shared: &SharedContext) -> Result<MirOperand, String> {
+    // 关键修复：guide.rs 的 build_place 处理 Index 时要调用它算下标
+    // 表达式的值（`self.build_expr(index, shared)`）——guide.rs 是跟
+    // 这个文件平级的顶层模块，之前这个方法是私有的（E0624），平级模块
+    // 访问不到，改成 pub(crate)。
+    pub(crate) fn build_expr(&mut self, expr: &HirExpr, shared: &SharedContext) -> Result<MirOperand, String> {
         if let HirExprKind::Literal(lit) = &expr.kind {
             return Ok(MirOperand::Constant(lit.clone()));
         }
@@ -704,87 +530,35 @@ impl MirBuilder {
                 //    get_intrinsic 特意把常量排除在外（见 intrinsic.rs
                 //    里 IntrinsicFn/IntrinsicConst 是两个不同枚举的
                 //    注释）。不在这里单独拦一道的话，下面第 4 步的
-                //    IntrinsicFn::from_str(func) 对这类名字必然返回
-                //    None，会一路落进最后"当成普通函数调用"的通用分支，
-                //    生成出 `MAX()` 这种把常量当零参函数调用的假代码
-                //    ——常量不该走 MirRvalue::Call 这条路，MirPlace::Static
-                //    才是它本该落的地方（这个变体当初就是为 i128::MAX
-                //    这类常量留的，见 mir.rs 里 MirPlace::Static 的注释）。
-                //    关键修复：这里原来错拿 IntrinsicFn::from_str 去解析
-                //    "i128::MAX" 这种常量名——IntrinsicFn::from_str 只认
-                //    "print"/"panic"/"linear" 这类函数名，永远不可能匹配
-                //    上常量名，这一步等于永远走不进去；就算侥幸改成能
-                //    匹配，解出来的也是 IntrinsicFn，喂给要 IntrinsicConst
-                //    的 get_constant 类型也对不上。IntrinsicFn（函数/图域
-                //    算子）和 IntrinsicConst（关联常量）是 intrinsic.rs
-                //    里两个独立的枚举，各管各的 from_str，不能混用。
-                if qualifier.is_none() && !*is_method && args.is_empty() {
-                    if let Some(name) = IntrinsicConst::from_str(func) {
-                        if let Some(constant) = get_constant(name) {
-                            return Ok(MirRvalue::Use(MirOperand::Move(MirPlace::Static(
-                                constant.name.to_string(),
-                            ))));
-                        }
-                    }
+                //    resolve_intrinsic_call 对这类名字必然返回
+                //    (false, None)，会一路落进最后"当成普通函数调用"的
+                //    通用分支，生成出 `MAX()` 这种把常量当零参函数调用
+                //    的假代码——常量不该走 MirRvalue::Call 这条路，
+                //    MirPlace::Static 才是它本该落的地方。
+                //
+                // 关键修复（这次拆分）：常量检测和内建函数检测这两段
+                // 逻辑挪到了 intrinsic.rs 的 try_resolve_constant_ref /
+                // resolve_intrinsic_call，这里只是委托调用——两个函数
+                // 都不需要 &mut MirBuilder，只需要这次调用长什么样和
+                // 两个状态位（in_forward/unsafe_depth），所以 intrinsic.rs
+                // 不用反过来认识 MirBuilder/mir.rs 的类型，具体原因见
+                // 那两个函数上面的注释。
+                if let Some(const_name) = crate::intrinsic::try_resolve_constant_ref(
+                    qualifier, func, *is_method, args.len(),
+                ) {
+                    return Ok(MirRvalue::Use(MirOperand::Move(MirPlace::Static(
+                        const_name.to_string(),
+                    ))));
                 }
 
                 // 4) 真正的内建/固有函数：查 intrinsic.rs 的注册表。
-                // 关键修复：原来这里调用的 lookup_by_str(func) 返回的是
-                // Option<&'static Intrinsic>（见 intrinsic.rs），根本不是
-                // 一个 (name, intrinsic) 二元组——但下面这行硬要
-                // `if let Some((name, intrinsic)) = lookup_by_str(func)`
-                // 去解构，类型对不上，编译不过（E0308）。而且 lookup_by_str
-                // 本身就是 intrinsic.rs 里注释写明"保留旧接口，方便
-                // mir_builder 逐步迁移"的兼容性过渡函数——现在直接改成
-                // 用 IntrinsicFn::from_str 拿到 name，再用 get_intrinsic
-                // 查真正的元数据，两步拼出原来想要的 (name, intrinsic)，
-                // 这个过渡接口已经没有存在的必要，intrinsic.rs 里那份
-                // 定义也一并删掉了。
-                let (is_intrinsic, intrinsic_name) = if qualifier.is_none() && !*is_method {
-                    let found = IntrinsicFn::from_str(func)
-                        .and_then(|name| get_intrinsic(name).map(|intrinsic| (name, intrinsic)));
-                    if let Some((name, intrinsic)) = found {
-                        if self.in_forward && !intrinsic.allowed_in_model {
-                            return Err(format!(
-                                "error[MD001]: side-effect `{}` is not allowed in model block (forward method)",
-                                func
-                            ));
-                        }
-        
-                        if intrinsic.requires_unsafe && self.unsafe_depth == 0 {
-                            return Err(format!(
-                                "call to unsafe intrinsic `{}` requires an `unsafe` block or `verify unsafe`",
-                                func
-                            ));
-                        }
-
-                        // 关键新增：交叉校验——sema 给这个调用表达式算出来
-                        // 的 expr.ty 和 intrinsic 注册表自己声明的签名，
-                        // 对"这个调用是否发散"这件事理论上必须给出一致的
-                        // 答案（比如 panic() 的 expr.ty 应该是 Type::Never，
-                        // 跟 Intrinsic::diverges() 一致）。只在 debug 构建
-                        // 里检查，正常运行零开销；一旦以后 sema 或
-                        // intrinsic.rs 哪边单独改了、两边判断标准分了叉，
-                        // 这里能在生成出有问题的 MIR 之前就炸出来，而不是
-                        // 留到 codegen 生成出编译不过（或者更糟、能编译但
-                        // 语义不对）的 Rust 代码才发现。
-                        debug_assert_eq!(
-                            match expr.ty {
-                                Type::Never => true,
-                                _ => false,
-                            },
-                            intrinsic.diverges(),
-                            "intrinsic `{}` 的签名声明的发散性跟 sema 算出的表达式类型对不上",
-                            func
-                        );
-
-                        (true, Some(name))
-                    } else {
-                        (false, None)
-                    }
-                } else {
-                    (false, None)
+                let expr_diverges = match expr.ty {
+                    Type::Never => true,
+                    _ => false,
                 };
+                let (is_intrinsic, intrinsic_name) = crate::intrinsic::resolve_intrinsic_call(
+                    qualifier, func, *is_method, self.in_forward, self.unsafe_depth, expr_diverges,
+                )?;
 
                 let full_name = match qualifier {
                     Some(q) => format!("{}::{}", q, func),

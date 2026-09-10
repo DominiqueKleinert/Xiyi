@@ -1561,7 +1561,7 @@ impl Parser {
                 let num = value.parse::<i64>().unwrap();
                 Ok(Expr {
                     id: self.next_expr_id(),
-                    kind: ExprKind::Literal(Literal::Int32(num)),
+                    kind: ExprKind::Literal(Literal::Int32(num as i32)),
                 })
             }
             Some((Token::Float, value)) => {
